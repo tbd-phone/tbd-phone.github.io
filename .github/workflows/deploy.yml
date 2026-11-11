@@ -1,0 +1,91 @@
+name: Deploy the loader
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: The TBD commit whose phone/loader/ folder to publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Require a full commit ID
+        env:
+          COMMIT: ${{ inputs.commit }}
+        run: |
+          case "$COMMIT" in
+            ''|*[!0-9a-f]*) echo "::error::commit must be a 40-character commit ID"; exit 1 ;;
+          esac
+          if [ "${#COMMIT}" -ne 40 ]; then echo "::error::commit must be a 40-character commit ID"; exit 1; fi
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.TBD_SOURCE_REPO }}
+          ref: ${{ inputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: source
+      - name: Require the commit to be on main, with the newest loader and staging script
+        id: current
+        working-directory: source
+        env:
+          COMMIT: ${{ inputs.commit }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin main
+          if ! git merge-base --is-ancestor "$COMMIT" origin/main; then
+            echo "::error::$COMMIT is not on main; only commits on main are published"
+            exit 1
+          fi
+          # The object at a path in a commit, or nothing when the commit has no such path.
+          at() { git rev-parse --verify --quiet "$1:$2" || true; }
+          tree="$(at "$COMMIT" phone/loader)"
+          stager="$(at "$COMMIT" phone/scripts/stage-loader.sh)"
+          if [ -z "$tree" ] || [ -z "$stager" ] \
+            || [ "$tree" != "$(at origin/main phone/loader)" ] \
+            || [ "$stager" != "$(at origin/main phone/scripts/stage-loader.sh)" ]; then
+            echo "A newer loader or staging script is on main, and its own deploy publishes it."
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo "deploy=true"
+            echo "tree=$tree"
+            echo "stager=$stager"
+          } >> "$GITHUB_OUTPUT"
+      - if: steps.current.outputs.deploy == 'true'
+        id: pages
+        uses: actions/configure-pages@v6
+      - name: Stage the loader's served files and stamp its origin
+        if: steps.current.outputs.deploy == 'true'
+        env:
+          COMMIT: ${{ inputs.commit }}
+          TREE: ${{ steps.current.outputs.tree }}
+          STAGER: ${{ steps.current.outputs.stager }}
+          ORIGIN: ${{ steps.pages.outputs.origin }}
+        run: |
+          set -euo pipefail
+          bash source/phone/scripts/stage-loader.sh source/phone/loader site "$ORIGIN"
+          printf '{"commit":"%s","tree":"%s","stager":"%s"}\n' "$COMMIT" "$TREE" "$STAGER" > site/version.json
+      - if: steps.current.outputs.deploy == 'true'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+      - if: steps.current.outputs.deploy == 'true'
+        id: deployment
+        uses: actions/deploy-pages@v5
